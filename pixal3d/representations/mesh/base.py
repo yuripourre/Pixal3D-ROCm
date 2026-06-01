@@ -35,26 +35,48 @@ class Mesh:
     def fill_holes(self, max_hole_perimeter=3e-2):
         vertices = self.vertices.clone().cuda().contiguous()
         faces = self.faces.clone().cuda().contiguous()
-        
-        mesh = cumesh.CuMesh()
-        mesh.init(vertices, faces)
-        mesh.get_edges()
-        mesh.get_boundary_info()
-        if mesh.num_boundaries == 0:
-            return
-        mesh.get_vertex_edge_adjacency()
-        mesh.get_vertex_boundary_adjacency()
-        mesh.get_manifold_boundary_adjacency()
-        mesh.read_manifold_boundary_adjacency()
-        mesh.get_boundary_connected_components()
-        mesh.get_boundary_loops()
-        if mesh.num_boundary_loops == 0:
-            return
-        mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
-        new_vertices, new_faces = mesh.read()
-        
-        self.vertices = new_vertices.to(self.device)
-        self.faces = new_faces.to(self.device)
+
+        try:
+            mesh = cumesh.CuMesh()
+            mesh.init(vertices, faces)
+            mesh.get_edges()
+            mesh.get_boundary_info()
+            if mesh.num_boundaries == 0:
+                return
+            mesh.get_vertex_edge_adjacency()
+            mesh.get_vertex_boundary_adjacency()
+            mesh.get_manifold_boundary_adjacency()
+            mesh.read_manifold_boundary_adjacency()
+            mesh.get_boundary_connected_components()
+            mesh.get_boundary_loops()
+            if mesh.num_boundary_loops == 0:
+                return
+            mesh.fill_holes(max_hole_perimeter=max_hole_perimeter)
+            new_vertices, new_faces = mesh.read()
+
+            # Sanity check: CuMesh on HIP sometimes returns a corrupted mesh
+            # (e.g., all vertices clipped to one half-space).  If the bounding
+            # box shrank significantly in any axis, discard the result.
+            orig_extent = vertices.max(dim=0).values - vertices.min(dim=0).values
+            new_extent = new_vertices.max(dim=0).values - new_vertices.min(dim=0).values
+            if (new_extent < orig_extent * 0.75).any():
+                import warnings
+                warnings.warn(
+                    "fill_holes returned a mesh with a significantly smaller bounding box "
+                    f"(orig {orig_extent.tolist()}, new {new_extent.tolist()}); "
+                    "discarding fill_holes result.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                return
+
+            self.vertices = new_vertices.to(self.device)
+            self.faces = new_faces.to(self.device)
+        except Exception as e:
+            import warnings
+            warnings.warn(
+                f"fill_holes failed ({e}); skipping.",
+                RuntimeWarning, stacklevel=2,
+            )
         
     def remove_faces(self, face_mask: torch.Tensor):
         vertices = self.vertices.clone().cuda().contiguous()

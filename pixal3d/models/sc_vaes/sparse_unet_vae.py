@@ -1,4 +1,5 @@
 from typing import *
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -243,7 +244,13 @@ class SparseResBlockC2S3d(nn.Module):
         h = x.replace(self.norm1(x.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv1(h)
-        subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
+        # On ROCm the subdivision logits for the camera-occluded half of the
+        # object are borderline (close to 0), so the 512->1024 refinement gets
+        # dropped there, leaving that region at half resolution. A small negative
+        # bias on the threshold lets those borderline voxels subdivide, recovering
+        # uniform detail. Controlled via SUBDIV_BIAS (default 0.0 = original).
+        _subdiv_bias = float(os.environ.get('SUBDIV_BIAS', '0.0'))
+        subdiv_binarized = subdiv.replace(subdiv.feats > -_subdiv_bias) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
         h = h.replace(self.norm2(h.feats))
@@ -496,8 +503,22 @@ class SparseUnetVaeDecoder(nn.Module):
                 else:
                     h = block(h)
         h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
-        h = self.output_layer(h)
+        # ROCm workaround: the fused fp16 layer_norm + output projection over the
+        # full ~5M-voxel feature tensor silently zeroes the output for a spatial
+        # subset of voxels (the camera-occluded half), producing flat-grey
+        # texture. Computing the final normalisation and 1x1 projection in fp32
+        # and in row-chunks yields correct values everywhere.
+        _feats = h.feats
+        _w = self.output_layer.weight.float()
+        _bias = self.output_layer.bias.float() if self.output_layer.bias is not None else None
+        _out = torch.empty(_feats.shape[0], _w.shape[0],
+                           device=_feats.device, dtype=torch.float32)
+        _CH = 262144
+        for _i in range(0, _feats.shape[0], _CH):
+            _chunk = _feats[_i:_i + _CH].float()
+            _ln = F.layer_norm(_chunk, _chunk.shape[-1:])
+            _out[_i:_i + _CH] = F.linear(_ln, _w, _bias)
+        h = h.replace(_out.type(x.dtype))
         if self.training and self.pred_subdiv:
             return h, subs_gt, subs
         else:

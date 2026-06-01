@@ -91,13 +91,19 @@ Generate a GLB mesh from a single image:
 python inference.py --image assets/images/0_img.png --output ./output.glb
 ```
 
-**Low-VRAM mode** (reduces peak VRAM by loading models on-demand):
+**Low-VRAM mode** — models stay on CPU and are streamed to GPU one stage at a time (~10–12 GB peak VRAM):
 
 ```bash
 python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram
 ```
 
-By default, the pipeline resolution is **1536** (standard mode) or **1024** (low-VRAM mode). You can override this with `--resolution`:
+**Smart-VRAM mode** — small conditioning models and decoders stay GPU-resident; large DiT models are loaded on demand and freed immediately after use. Faster than `--low_vram` with similar peak VRAM. Automatically uses 1024 resolution:
+
+```bash
+python inference.py --image assets/images/0_img.png --output ./output.glb --smart_vram
+```
+
+By default, the pipeline resolution is **1536** (standard mode) or **1024** (`--low_vram` / `--smart_vram`). Override with `--resolution`:
 
 ```bash
 # Force 1536 even in low-VRAM mode
@@ -107,17 +113,63 @@ python inference.py --image assets/images/0_img.png --output ./output.glb --low_
 python inference.py --image assets/images/0_img.png --output ./output.glb --resolution 1024
 ```
 
-**Tip**: If you don't have `flash_attn` installed, you can use PyTorch's built-in SDPA backend instead:
-> ```bash
-> ATTN_BACKEND=sdpa python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram
-> ```
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ATTN_BACKEND` | `flash_attn` | Set to `sdpa` to use PyTorch's built-in SDPA instead of `flash_attn` |
+| `SPARSE_ATTN_BACKEND` | `flash_attn` | Set to `sdpa` to use PyTorch's built-in SDPA for sparse attention |
+| `PIXAL_TIMING` | `0` | Set to `1` to print per-stage wall-clock timings |
+| `TEX_FACE_BUDGET` | *(disabled)* | Max triangle count before texture-bake decimation (e.g. `50000`) |
+| `DC_RESOLUTION` | `256` | Dual Contouring remesh resolution (lower = faster, coarser mesh) |
+| `FILL_PASSES` | `5` | GPU dilation passes for texture gap-filling (covers ~5 texel radius) |
+| `NN_CHUNK` | *(auto)* | Chunk size for GPU nearest-neighbour voxel lookup (reduce if OOM) |
+| `SDPA_Q_CHUNK` | *(disabled)* | Split Q into chunks of this size inside sparse SDPA (e.g. `2048`). Reduces peak VRAM when flash attention is unavailable |
+| `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL` | `0` | Set to `1` on AMD gfx1xxx GPUs to enable AOTriton-backed flash / memory-efficient attention and avoid O(N²) memory in SDPA |
+
+If you don't have `flash_attn` installed, use the SDPA fallback:
+
+```bash
+ATTN_BACKEND=sdpa SPARSE_ATTN_BACKEND=sdpa python inference.py \
+    --image assets/images/0_img.png --output ./output.glb --low_vram
+```
+
+#### AMD ROCm (gfx1xxx / RDNA)
+
+Set your ROCm architecture and disable CUDA-only attention backends before running:
+
+```bash
+export PYTORCH_ROCM_ARCH=gfx1201   # replace with your GPU arch (e.g. gfx1100 for RX 7900)
+export ATTN_BACKEND=sdpa
+export SPARSE_ATTN_BACKEND=sdpa
+```
+
+Then run with `--smart_vram` (recommended — keeps small models GPU-resident, streams DiTs on demand):
+
+```bash
+python inference.py --image assets/images/0_img.png --output ./output.glb --smart_vram
+```
+
+One-liner with timing enabled:
+
+```bash
+PYTORCH_ROCM_ARCH=gfx1201 \
+ATTN_BACKEND=sdpa SPARSE_ATTN_BACKEND=sdpa \
+TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1 \
+PIXAL_TIMING=1 \
+    python inference.py --image assets/images/0_img.png --output ./output.glb --smart_vram
+```
+
+> **Note**: The first run on a new GPU architecture triggers HIP kernel compilation, which can take several minutes. Subsequent runs use the cached kernels and are much faster.
+>
+> **`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`** is required on gfx1xxx (RDNA3/RDNA4) to enable AOTriton-backed flash and memory-efficient attention. Without it, PyTorch SDPA silently falls back to the O(N²) math kernel, which OOMs on the high-resolution shape DiT.
 
 ### Web Demo
 
 We provide a Gradio web demo for Pixal3D, which allows you to generate 3D meshes from images interactively.
 
 ```bash
-python app.py 
+python app.py
 ```
 
 Low-VRAM mode is also available for the web demo. The frontend default resolution will automatically switch to 1024 in low-VRAM mode (1536 otherwise), but can be changed manually in the UI.

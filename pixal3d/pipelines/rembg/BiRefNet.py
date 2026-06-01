@@ -5,11 +5,28 @@ from torchvision import transforms
 from PIL import Image
 
 
+BIREFNET_FALLBACK = "ZhengPeng7/BiRefNet"
+
+
 class BiRefNet:
-    def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
-        self.model = AutoModelForImageSegmentation.from_pretrained(
-            model_name, trust_remote_code=True
-        )
+    def __init__(self, model_name: str = BIREFNET_FALLBACK):
+        try:
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                model_name, trust_remote_code=True
+            )
+        except Exception as e:
+            if model_name == BIREFNET_FALLBACK:
+                raise
+            import warnings
+            warnings.warn(
+                f"Could not load BiRefNet from {model_name!r} ({e}); "
+                f"falling back to {BIREFNET_FALLBACK!r}.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                BIREFNET_FALLBACK, trust_remote_code=True
+            )
         self.model.eval()
         self.transform_image = transforms.Compose(
             [

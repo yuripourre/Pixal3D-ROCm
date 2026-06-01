@@ -8,10 +8,17 @@ import cv2
 from PIL import Image
 
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+# expandable_segments reduces fragmentation on both CUDA and ROCm allocators
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_HIP_ALLOC_CONF"]  = "expandable_segments:True"
+# Enable AOTriton-backed flash / memory-efficient attention on AMD gfx1xxx GPUs.
+# Without this flag PyTorch SDPA silently falls back to the O(N²) math kernel.
+os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
+
+_TIMING = int(os.environ.get("PIXAL_TIMING", "0"))
 
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
 import o_voxel
@@ -71,7 +78,7 @@ def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
     return moge_model
 
 
-def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
+def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False, smart_vram=False):
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
 
@@ -81,32 +88,51 @@ def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False):
     pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
     pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
 
-    if low_vram:
-        # Low-VRAM mode: models stay on CPU, loaded to GPU on-demand per stage.
-        # Peak VRAM = one flow model + one DinoV3, not all ~18 GB at once.
-        print("[NAF] Pre-downloading NAF upsampler weights (CPU only)...")
-        for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
-                     'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
+    _cond_model_attrs = [
+        'image_cond_model_ss', 'image_cond_model_shape_512',
+        'image_cond_model_shape_1024', 'image_cond_model_tex_1024',
+    ]
+    # Pre-load NAF upsampler weights for all modes (required before GPU transfer).
+    print("[NAF] Pre-loading NAF upsampler weights...")
+    for attr in _cond_model_attrs:
+        m = getattr(pipeline, attr, None)
+        if m is not None and getattr(m, 'use_naf_upsample', False):
+            m._load_naf()
+
+    if smart_vram:
+        # Smart-VRAM mode: small resident models (conditioning + decoders) live on
+        # GPU permanently; large DiTs stream to GPU on demand then are freed with
+        # del + empty_cache (no wasteful CPU copy-back for single-run workloads).
+        pipeline.low_vram = True
+        pipeline.smart_vram = True
+        pipeline._device = torch.device(device)
+
+        # Resident set: 4 conditioning models + 3 decoders + rembg (~4-5 GB total)
+        for attr in _cond_model_attrs:
             m = getattr(pipeline, attr, None)
-            if m is not None and getattr(m, 'use_naf_upsample', False):
-                m._load_naf()
+            if m is not None:
+                m.to(device)
+        for name in ['sparse_structure_decoder', 'shape_slat_decoder', 'tex_slat_decoder']:
+            if name in pipeline.models:
+                pipeline.models[name].to(device)
+        if pipeline.rembg_model is not None:
+            pipeline.rembg_model.to(device)
+        # Large DiTs stay on CPU: sparse_structure_flow_model,
+        # shape_slat_flow_model_512/1024, tex_slat_flow_model_1024
+        print("[Pipeline] Smart-VRAM mode: resident models on GPU, large DiTs stream on demand.")
+    elif low_vram:
+        # Low-VRAM mode: all models stay on CPU, loaded to GPU one at a time.
         pipeline._device = torch.device(device)
         pipeline.low_vram = True
         print("[Pipeline] Low-VRAM mode enabled.")
     else:
-        # Standard mode: all models loaded to GPU at once (faster, needs more VRAM).
+        # Standard mode: all models loaded to GPU at once.
         pipeline.low_vram = False
         pipeline.cuda()
-        pipeline.image_cond_model_ss.cuda()
-        pipeline.image_cond_model_shape_512.cuda()
-        pipeline.image_cond_model_shape_1024.cuda()
-        pipeline.image_cond_model_tex_1024.cuda()
-        print("[NAF] Pre-loading NAF upsampler model...")
-        for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
-                     'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
+        for attr in _cond_model_attrs:
             m = getattr(pipeline, attr, None)
-            if m is not None and getattr(m, 'use_naf_upsample', False):
-                m._load_naf()
+            if m is not None:
+                m.cuda()
         print("[Pipeline] Standard mode (all models on GPU).")
 
     return pipeline
@@ -181,10 +207,15 @@ def run_inference(
     model_path: str = MODEL_PATH,
     manual_fov: float = -1.0,
     low_vram: bool = False,
+    smart_vram: bool = False,
     resolution: int = -1,
 ):
     # Load models
-    pipeline = init_pipeline(model_path, low_vram=low_vram)
+    _t_total = time.perf_counter()
+    _t = time.perf_counter()
+    pipeline = init_pipeline(model_path, low_vram=low_vram, smart_vram=smart_vram)
+    if _TIMING:
+        print(f"[TIMING] model_load={time.perf_counter()-_t:.1f}s", flush=True)
 
     # Preprocess image first — rembg loads to GPU for this call, then offloads.
     # MoGe is loaded afterwards so both never occupy VRAM at the same time.
@@ -209,6 +240,7 @@ def run_inference(
         camera_params = {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}
         print(f"[Inference] Using manual FOV: {math.degrees(manual_fov):.2f}° ({manual_fov:.4f} rad), distance={distance:.4f}")
     else:
+        _t = time.perf_counter()
         print("[MoGe-2] Loading model for camera estimation...")
         moge_model = load_moge_model(device="cuda")
         print("[Inference] Estimating camera parameters...")
@@ -222,6 +254,8 @@ def run_inference(
         moge_model.cpu()
         del moge_model
         torch.cuda.empty_cache()
+        if _TIMING:
+            print(f"[TIMING] camera_estimation={time.perf_counter()-_t:.1f}s", flush=True)
     os.remove(tmp_path)
 
     # Run pipeline
@@ -241,8 +275,9 @@ def run_inference(
         "guidance_rescale": tex_slat_guidance_rescale, "rescale_t": tex_slat_rescale_t,
     }
 
-    pipeline_type = f"{resolution if resolution > 0 else (1024 if low_vram else 1536)}_cascade"
+    pipeline_type = f"{resolution if resolution > 0 else (1024 if (low_vram or smart_vram) else 1536)}_cascade"
     print(f"[Inference] Using pipeline_type={pipeline_type}")
+    _t = time.perf_counter()
     mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
         image_preprocessed,
         camera_params=camera_params,
@@ -256,10 +291,13 @@ def run_inference(
         max_num_tokens=max_num_tokens,
     )
 
+    if _TIMING:
+        print(f"[TIMING] pipeline_run={time.perf_counter()-_t:.1f}s", flush=True)
     mesh = mesh_list[0]
 
     # Extract GLB
     print("[Inference] Extracting GLB...")
+    _t = time.perf_counter()
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
         coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
@@ -267,6 +305,10 @@ def run_inference(
         decimation_target=1000000, texture_size=4096,
         remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
     )
+
+    if _TIMING:
+        print(f"[TIMING] to_glb={time.perf_counter()-_t:.1f}s", flush=True)
+        print(f"[TIMING] total={time.perf_counter()-_t_total:.1f}s", flush=True)
 
     # Apply rotation
     rot = np.array([
@@ -296,8 +338,12 @@ if __name__ == "__main__":
     parser.add_argument("--low_vram", action="store_true",
                         help="Enable low-VRAM mode: models stay on CPU and are loaded to GPU on-demand per stage. "
                              "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
+    parser.add_argument("--smart_vram", action="store_true",
+                        help="Enable smart-VRAM mode: small conditioning models and decoders stay GPU-resident; "
+                             "large DiTs stream to GPU on demand and are freed after use. "
+                             "Faster than --low_vram with similar peak VRAM. Pins to 1024 resolution.")
     parser.add_argument("--resolution", type=int, default=-1,
-                        help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
+                        help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram/--smart_vram, else 1536.")
 
     args = parser.parse_args()
 
@@ -308,5 +354,6 @@ if __name__ == "__main__":
         manual_fov=args.fov,
         model_path=args.model_path,
         low_vram=args.low_vram,
+        smart_vram=args.smart_vram,
         resolution=args.resolution,
     )

@@ -35,6 +35,77 @@ def __getattr__(name):
     return globals()[name]
 
 
+def _load_safetensors(filename: str, device: str = "cpu") -> dict:
+    """
+    Load a safetensors file, with fallback handling for non-standard dtypes
+    such as C64/C128 complex tensors that the standard safetensors Rust
+    backend rejects.
+    """
+    import struct
+    import json
+    import mmap
+    import torch
+
+    DTYPE_MAP = {
+        "F64": (torch.float64, 8),
+        "F32": (torch.float32, 4),
+        "F16": (torch.float16, 2),
+        "BF16": (torch.bfloat16, 2),
+        "I64": (torch.int64, 8),
+        "I32": (torch.int32, 4),
+        "I16": (torch.int16, 2),
+        "I8": (torch.int8, 1),
+        "U8": (torch.uint8, 1),
+        "BOOL": (torch.bool, 1),
+    }
+    COMPLEX_MAP = {
+        "C64": (torch.float32, 4),
+        "C128": (torch.float64, 8),
+    }
+
+    try:
+        from safetensors.torch import load_file
+        return load_file(filename, device=device)
+    except Exception:
+        pass
+
+    tensors = {}
+    with open(filename, "rb") as f:
+        raw_header_len = f.read(8)
+        header_len = struct.unpack("<Q", raw_header_len)[0]
+        header_bytes = f.read(header_len)
+        header = json.loads(header_bytes)
+
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        data_offset = 8 + header_len
+
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            dtype_str = meta["dtype"]
+            shape = meta["shape"]
+            start, end = meta["data_offsets"]
+            abs_start = data_offset + start
+            abs_end = data_offset + end
+            raw = mm[abs_start:abs_end]
+
+            if dtype_str in COMPLEX_MAP:
+                float_dtype, itemsize = COMPLEX_MAP[dtype_str]
+                buf = torch.frombuffer(bytearray(raw), dtype=float_dtype)
+                t = torch.view_as_complex(buf.reshape(shape + [2]))
+            elif dtype_str in DTYPE_MAP:
+                torch_dtype, _ = DTYPE_MAP[dtype_str]
+                t = torch.frombuffer(bytearray(raw), dtype=torch_dtype).reshape(shape)
+            else:
+                raise ValueError(f"Unknown dtype {dtype_str!r} for tensor {key!r}")
+
+            tensors[key] = t.to(device)
+
+        mm.close()
+
+    return tensors
+
+
 def from_pretrained(path: str, **kwargs):
     """
     Load a model from a pretrained checkpoint.
@@ -46,7 +117,6 @@ def from_pretrained(path: str, **kwargs):
     """
     import os
     import json
-    from safetensors.torch import load_file
     is_local = os.path.exists(f"{path}.json") and os.path.exists(f"{path}.safetensors")
 
     if is_local:
@@ -63,7 +133,7 @@ def from_pretrained(path: str, **kwargs):
     with open(config_file, 'r') as f:
         config = json.load(f)
     model = __getattr__(config['name'])(**config['args'], **kwargs)
-    model.load_state_dict(load_file(model_file), strict=False)
+    model.load_state_dict(_load_safetensors(model_file), strict=False)
 
     return model
 
