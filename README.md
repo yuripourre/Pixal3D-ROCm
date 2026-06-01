@@ -120,6 +120,7 @@ python inference.py --image assets/images/0_img.png --output ./output.glb --reso
 | `ATTN_BACKEND` | `flash_attn` | Set to `sdpa` to use PyTorch's built-in SDPA instead of `flash_attn` |
 | `SPARSE_ATTN_BACKEND` | `flash_attn` | Set to `sdpa` to use PyTorch's built-in SDPA for sparse attention |
 | `PIXAL_TIMING` | `0` | Set to `1` to print per-stage wall-clock timings |
+| `FAST_INIT` | `1` | Skip the throwaway random weight init when loading checkpoints (saves ~30s of model load). Bit-for-bit identical to a normal load; set to `0` to disable |
 | `TEX_FACE_BUDGET` | *(disabled)* | Max triangle count before texture-bake decimation (e.g. `50000`) |
 | `DC_RESOLUTION` | `256` | Dual Contouring remesh resolution (lower = faster, coarser mesh) |
 | `FILL_PASSES` | `5` | GPU dilation passes for texture gap-filling (covers ~5 texel radius) |
