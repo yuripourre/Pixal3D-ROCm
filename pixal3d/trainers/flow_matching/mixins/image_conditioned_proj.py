@@ -19,6 +19,11 @@ import torch.distributed as dist
 from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
 
+# When NAF_BF16=1 the NAF upsample forward is wrapped in torch.autocast(bfloat16).
+# Halves compute and bandwidth for the 1024-target NAF pass.  Off by default;
+# enable only after confirming texture quality is visually identical.
+_NAF_BF16 = os.environ.get("NAF_BF16", "0") == "1"
+
 
 # =============================================================================
 # Projection Utilities
@@ -556,9 +561,17 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 self._load_naf()
                 # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
                 lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
-                hr_features = self.naf_model(
-                    image_for_naf, lr_features_bchw, self.naf_target_size
-                )  # [B, D, H', W']
+                if _NAF_BF16:
+                    with torch.autocast(device_type=image_for_naf.device.type, dtype=torch.bfloat16):
+                        hr_features = self.naf_model(
+                            image_for_naf, lr_features_bchw, self.naf_target_size
+                        )  # [B, D, H', W']
+                    # Cast back so downstream proj_grid and cat with z_proj_lr stay FP32.
+                    hr_features = hr_features.to(z_patchtokens_spatial.dtype)
+                else:
+                    hr_features = self.naf_model(
+                        image_for_naf, lr_features_bchw, self.naf_target_size
+                    )  # [B, D, H', W']
 
                 # Sample from high-res feature map using same projection coordinates
                 z_proj_hr = self.proj_grid(

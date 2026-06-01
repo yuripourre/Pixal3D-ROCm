@@ -40,6 +40,13 @@ def _load_safetensors(filename: str, device: str = "cpu") -> dict:
     Load a safetensors file, with fallback handling for non-standard dtypes
     such as C64/C128 complex tensors that the standard safetensors Rust
     backend rejects.
+
+    Load strategy (fastest to slowest):
+    1. safetensors.safe_open  — Rust mmap-backed, single-copy, handles the
+       checkpoints correctly even when load_file fails on some ROCm builds.
+    2. Python memoryview fallback — single-copy: zero-copy memoryview slice
+       into the mmap, then one .clone() to own the data.  Needed when the Rust
+       backend does not support a dtype (C64/C128) or raises any exception.
     """
     import struct
     import json
@@ -47,36 +54,43 @@ def _load_safetensors(filename: str, device: str = "cpu") -> dict:
     import torch
 
     DTYPE_MAP = {
-        "F64": (torch.float64, 8),
-        "F32": (torch.float32, 4),
-        "F16": (torch.float16, 2),
-        "BF16": (torch.bfloat16, 2),
-        "I64": (torch.int64, 8),
-        "I32": (torch.int32, 4),
-        "I16": (torch.int16, 2),
-        "I8": (torch.int8, 1),
-        "U8": (torch.uint8, 1),
-        "BOOL": (torch.bool, 1),
+        "F64": torch.float64,
+        "F32": torch.float32,
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "I64": torch.int64,
+        "I32": torch.int32,
+        "I16": torch.int16,
+        "I8": torch.int8,
+        "U8": torch.uint8,
+        "BOOL": torch.bool,
     }
-    COMPLEX_MAP = {
-        "C64": (torch.float32, 4),
-        "C128": (torch.float64, 8),
+    COMPLEX_REAL_MAP = {
+        "C64": torch.float32,
+        "C128": torch.float64,
     }
 
+    # Fast path: safe_open uses the Rust mmap backend and avoids ROCm issues
+    # that can occur with safetensors.torch.load_file on some builds.
     try:
-        from safetensors.torch import load_file
-        return load_file(filename, device=device)
+        from safetensors import safe_open
+        tensors = {}
+        with safe_open(filename, framework="pt", device=device) as f:
+            for key in f.keys():
+                tensors[key] = f.get_tensor(key)
+        return tensors
     except Exception:
         pass
 
+    # Python fallback: single-copy via memoryview (zero-copy view into the mmap,
+    # then one .clone() to produce an owned tensor before closing the mmap).
     tensors = {}
     with open(filename, "rb") as f:
-        raw_header_len = f.read(8)
-        header_len = struct.unpack("<Q", raw_header_len)[0]
-        header_bytes = f.read(header_len)
-        header = json.loads(header_bytes)
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
 
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        mv = memoryview(mm)
         data_offset = 8 + header_len
 
         for key, meta in header.items():
@@ -87,20 +101,27 @@ def _load_safetensors(filename: str, device: str = "cpu") -> dict:
             start, end = meta["data_offsets"]
             abs_start = data_offset + start
             abs_end = data_offset + end
-            raw = mm[abs_start:abs_end]
 
-            if dtype_str in COMPLEX_MAP:
-                float_dtype, itemsize = COMPLEX_MAP[dtype_str]
-                buf = torch.frombuffer(bytearray(raw), dtype=float_dtype)
-                t = torch.view_as_complex(buf.reshape(shape + [2]))
+            # Use a named slice so we can explicitly delete it after cloning,
+            # which releases the exported-pointer reference on the mmap.
+            chunk = mv[abs_start:abs_end]
+            if dtype_str in COMPLEX_REAL_MAP:
+                real_dtype = COMPLEX_REAL_MAP[dtype_str]
+                _tmp = torch.frombuffer(chunk, dtype=real_dtype)
+                t = torch.view_as_complex(_tmp.reshape(shape + [2])).clone()
+                del _tmp
             elif dtype_str in DTYPE_MAP:
-                torch_dtype, _ = DTYPE_MAP[dtype_str]
-                t = torch.frombuffer(bytearray(raw), dtype=torch_dtype).reshape(shape)
+                _tmp = torch.frombuffer(chunk, dtype=DTYPE_MAP[dtype_str])
+                t = _tmp.reshape(shape).clone()
+                del _tmp
             else:
                 raise ValueError(f"Unknown dtype {dtype_str!r} for tensor {key!r}")
+            del chunk  # release exported pointer on mv/mm
 
             tensors[key] = t.to(device)
 
+        # All chunk/tmp references are gone; release mv then close the mmap.
+        del mv
         mm.close()
 
     return tensors
