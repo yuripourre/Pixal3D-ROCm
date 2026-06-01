@@ -104,10 +104,12 @@ IMAGE_COND_CONFIGS = {
 # Model Loading
 # ============================================================================
 
-def build_image_cond_model(config: dict):
+def build_image_cond_model(config: dict, backbone=None, naf_model=None):
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
-    model = DinoV3ProjFeatureExtractor(**config)
+    model = DinoV3ProjFeatureExtractor(**config, backbone=backbone)
     model.eval()
+    if naf_model is not None and model.use_naf_upsample:
+        model.naf_model = naf_model
     return model
 
 def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
@@ -151,21 +153,35 @@ def init_models():
         model_path = "TencentARC/Pixal3D"
         print(f"[Pipeline] Loading from {model_path}...")
         pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
-        
+
+        # Load shared backbone + NAF once instead of 4x and 3x respectively.
+        from transformers import DINOv3ViTModel as _DINOv3ViTModel
+        _dino_model_name = IMAGE_COND_CONFIGS["ss"]["model_name"]
+        print(f"[ImageCond] Loading shared DINOv3 backbone ({_dino_model_name})...")
+        _shared_backbone = _DINOv3ViTModel.from_pretrained(_dino_model_name)
+        _shared_backbone.eval()
+        _shared_backbone.requires_grad_(False)
+
+        import torch.hub as _hub
+        print("[NAF] Loading shared NAF upsampler weights...")
+        _shared_naf = _hub.load(
+            "valeoai/NAF", "naf", pretrained=True, device="cpu", trust_repo=True
+        )
+        _shared_naf.eval()
+        _shared_naf.requires_grad_(False)
+
         print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
-        pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
-        pipeline.image_cond_model_shape_512 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_512"])
-        pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
-        pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
-        
+        pipeline.image_cond_model_ss = build_image_cond_model(
+            IMAGE_COND_CONFIGS["ss"], backbone=_shared_backbone, naf_model=_shared_naf)
+        pipeline.image_cond_model_shape_512 = build_image_cond_model(
+            IMAGE_COND_CONFIGS["shape_512"], backbone=_shared_backbone, naf_model=_shared_naf)
+        pipeline.image_cond_model_shape_1024 = build_image_cond_model(
+            IMAGE_COND_CONFIGS["shape_1024"], backbone=_shared_backbone, naf_model=_shared_naf)
+        pipeline.image_cond_model_tex_1024 = build_image_cond_model(
+            IMAGE_COND_CONFIGS["tex_1024"], backbone=_shared_backbone, naf_model=_shared_naf)
+
         if LOW_VRAM:
             # Low-VRAM mode: models stay on CPU, loaded to GPU on-demand per stage.
-            print("[NAF] Pre-downloading NAF upsampler weights (CPU only)...")
-            for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
-                         'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
-                m = getattr(pipeline, attr, None)
-                if m is not None and getattr(m, 'use_naf_upsample', False):
-                    m._load_naf()
             pipeline._device = torch.device("cuda")
             pipeline.low_vram = True
             print("[Pipeline] Low-VRAM mode enabled.")
@@ -177,12 +193,8 @@ def init_models():
             pipeline.image_cond_model_shape_512.cuda()
             pipeline.image_cond_model_shape_1024.cuda()
             pipeline.image_cond_model_tex_1024.cuda()
-            print("[NAF] Pre-loading NAF upsampler model...")
-            for attr in ['image_cond_model_ss', 'image_cond_model_shape_512',
-                         'image_cond_model_shape_1024', 'image_cond_model_tex_1024']:
-                m = getattr(pipeline, attr, None)
-                if m is not None and getattr(m, 'use_naf_upsample', False):
-                    m._load_naf()
+            # Move shared NAF to GPU (shared ref — one .cuda() call covers all)
+            _shared_naf.cuda()
                 
         print("[MoGe-2] Loading model for camera estimation...")
         if LOW_VRAM:

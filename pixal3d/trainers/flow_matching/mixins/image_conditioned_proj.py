@@ -362,12 +362,13 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         naf_target_size: Target spatial size for NAF upsampling (default: [128, 128])
     """
     def __init__(
-        self, 
+        self,
         model_name: str,
         image_size: int = 512,
         grid_resolution: int = 16,
         use_naf_upsample: bool = False,
         naf_target_size: Optional[List[int]] = None,
+        backbone: Optional[Any] = None,
     ):
         super().__init__()
         self.model_name = model_name
@@ -380,11 +381,16 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             self.naf_target_size = (naf_target_size, naf_target_size)
         else:
             self.naf_target_size = tuple(naf_target_size)
-        
-        # Load DINOv3 model (frozen, no trainable params in this module)
-        self.model = DINOv3ViTModel.from_pretrained(model_name)
-        self.model.eval()
-        self.model.requires_grad_(False)
+
+        # DINOv3 backbone: accept a pre-loaded shared instance or load from disk.
+        # Sharing one frozen backbone across all 4 extractors avoids loading the
+        # same ViT-L checkpoint 4 times (saves ~10-15 s at startup).
+        if backbone is not None:
+            self.model = backbone  # shared ref — must already be .eval() + frozen
+        else:
+            self.model = DINOv3ViTModel.from_pretrained(model_name)
+            self.model.eval()
+            self.model.requires_grad_(False)
         
         # Image transform (only normalize, no resize - assume already resized)
         self.transform = transforms.Compose([
@@ -468,17 +474,23 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         distance: Optional[torch.Tensor] = None,
         mesh_scale: Optional[torch.Tensor] = None,
         transform_matrix: Optional[torch.Tensor] = None,
+        cached_z: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract view-aligned features from the image.
-        
+
         Args:
             image: Input image tensor [B, C, H, W] or list of PIL images
             camera_angle_x: Camera FOV angle in radians [B]
             distance: Camera distance [B]
             mesh_scale: Mesh scale factor [B]
             transform_matrix: Optional camera transform matrix [B, 4, 4]
-        
+            cached_z: Pre-computed DINOv3 backbone hidden states [B, tokens, D].
+                If supplied, the ViT-L forward pass (extract_features) is skipped
+                and this tensor is used directly. Safe only when the frozen model
+                weights and the image content/size are identical to the run that
+                produced cached_z.  The result is stored in self._last_z.
+
         Returns:
             Tuple of (global_features, proj_features):
             - global_features: [B, num_global_tokens, embed_dim]
@@ -496,43 +508,49 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             image = torch.stack(image).cuda()
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
-        
+
         B = image.shape[0]
-        
+
         # Keep a copy of the unnormalized image for NAF guide
         if self.use_naf_upsample:
             image_for_naf = image.clone()  # [B, 3, H, W], in [0, 1] range
-        
+
         # Apply transform (ImageNet normalization)
         image = self.transform(image)
-        
-        # Extract DINOv3 features (frozen, no gradients)
+
         with torch.no_grad():
-            z = self.extract_features(image)
-            
+            if cached_z is not None:
+                # Reuse pre-computed backbone features; skip the expensive ViT-L forward.
+                z = cached_z.to(image.device)
+            else:
+                z = self.extract_features(image)
+
+            # Store so callers can retrieve it as a cache for the next stage.
+            self._last_z = z
+
             # Split into CLS token, register tokens, and patch tokens
             z_clstoken = z[:, 0:1]  # [B, 1, D]
             num_reg = getattr(self.model.config, 'num_register_tokens', 4)
             z_regtokens = z[:, 1:1+num_reg]  # [B, num_reg, D]
             z_patchtokens = z[:, 1+num_reg:]  # [B, num_patches, D]
-            
+
             # Reshape patch tokens to spatial grid: [B, h, w, D]
             z_patchtokens_spatial = z_patchtokens.reshape(
                 B, self.patch_number, self.patch_number, -1
             )  # [B, h, w, D]
-            
+
             if camera_angle_x is None or distance is None or mesh_scale is None:
                 raise ValueError("camera_angle_x, distance, and mesh_scale must be provided")
-            
+
             # --- Low-resolution branch: sample from DINOv3 patch feature map ---
             z_proj_lr = self.proj_grid(
-                z_patchtokens_spatial, 
-                camera_angle_x, 
-                distance, 
+                z_patchtokens_spatial,
+                camera_angle_x,
+                distance,
                 mesh_scale,
                 transform_matrix
             )  # [B, grid_res³, D]
-            
+
             # --- High-resolution branch (NAF): upsample then sample ---
             if self.use_naf_upsample:
                 self._load_naf()
@@ -541,7 +559,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 hr_features = self.naf_model(
                     image_for_naf, lr_features_bchw, self.naf_target_size
                 )  # [B, D, H', W']
-                
+
                 # Sample from high-res feature map using same projection coordinates
                 z_proj_hr = self.proj_grid(
                     hr_features,
@@ -551,18 +569,18 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                     transform_matrix,
                     BHWC=False  # hr_features is [B, C, H', W']
                 )  # [B, grid_res³, D]
-                
+
                 # Concatenate lr and hr: [B, grid_res³, D*2]
                 z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)
             else:
                 z_proj = z_proj_lr  # [B, grid_res³, D]
-                
+
             # Combine global tokens
             z_global = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B, 1+num_reg, D]
-        
+
         # proj_linear has been moved to per-block ProjectAttention
         # z_proj stays in proj_channels, each block will project independently
-        
+
         return z_global, z_proj
     
     @torch.no_grad()

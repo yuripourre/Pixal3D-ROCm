@@ -132,8 +132,11 @@ def from_pretrained(path: str, **kwargs):
 
     with open(config_file, 'r') as f:
         config = json.load(f)
+
+    state = _load_safetensors(model_file)
+
     model = __getattr__(config['name'])(**config['args'], **kwargs)
-    model.load_state_dict(_load_safetensors(model_file), strict=False)
+    model.load_state_dict(state, strict=False)
 
     return model
 

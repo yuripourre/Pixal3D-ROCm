@@ -63,10 +63,13 @@ IMAGE_COND_CONFIGS = {
 # Model Loading
 # ============================================================================
 
-def build_image_cond_model(config: dict):
+def build_image_cond_model(config: dict, backbone=None, naf_model=None):
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
-    model = DinoV3ProjFeatureExtractor(**config)
+    model = DinoV3ProjFeatureExtractor(**config, backbone=backbone)
     model.eval()
+    if naf_model is not None and model.use_naf_upsample:
+        # Inject shared NAF instance directly, skipping per-extractor _load_naf().
+        model.naf_model = naf_model
     return model
 
 
@@ -79,25 +82,58 @@ def load_moge_model(device="cuda", model_name=MOGE_MODEL_NAME):
 
 
 def init_pipeline(model_path=MODEL_PATH, device="cuda", low_vram=False, smart_vram=False):
+    _t_init = time.perf_counter()
+
+    # Load all 7 DiT/decoder checkpoints from disk.
     print(f"[Pipeline] Loading from {model_path}...")
     pipeline = Pixal3DImageTo3DPipeline.from_pretrained(model_path)
+    if _TIMING:
+        print(f"[TIMING]   model_load:dits={time.perf_counter()-_t_init:.1f}s", flush=True)
 
+    # Load the frozen DINOv3 ViT-L backbone exactly ONCE and share it across
+    # all 4 DinoV3ProjFeatureExtractor instances (was loaded 4x, each ~5-10 s).
+    _t = time.perf_counter()
+    from transformers import DINOv3ViTModel as _DINOv3ViTModel
+    _dino_model_name = IMAGE_COND_CONFIGS["ss"]["model_name"]
+    print(f"[ImageCond] Loading shared DINOv3 backbone ({_dino_model_name})...")
+    _shared_backbone = _DINOv3ViTModel.from_pretrained(_dino_model_name)
+    _shared_backbone.eval()
+    _shared_backbone.requires_grad_(False)
+    if _TIMING:
+        print(f"[TIMING]   model_load:dino_backbone={time.perf_counter()-_t:.1f}s", flush=True)
+
+    # Load NAF upsampler ONCE and share across the 3 NAF-using extractors.
+    _t = time.perf_counter()
+    import torch.hub as _hub
+    print("[NAF] Loading shared NAF upsampler weights...")
+    _shared_naf = _hub.load(
+        "valeoai/NAF", "naf", pretrained=True, device="cpu", trust_repo=True
+    )
+    _shared_naf.eval()
+    _shared_naf.requires_grad_(False)
+    if _TIMING:
+        print(f"[TIMING]   model_load:naf={time.perf_counter()-_t:.1f}s", flush=True)
+
+    # Build the 4 extractors — construction now costs only ProjGrid creation,
+    # not ViT-L or NAF loading.
+    _t = time.perf_counter()
     print("[ImageCond] Building DinoV3ProjFeatureExtractor models...")
-    pipeline.image_cond_model_ss = build_image_cond_model(IMAGE_COND_CONFIGS["ss"])
-    pipeline.image_cond_model_shape_512 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_512"])
-    pipeline.image_cond_model_shape_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["shape_1024"])
-    pipeline.image_cond_model_tex_1024 = build_image_cond_model(IMAGE_COND_CONFIGS["tex_1024"])
+    pipeline.image_cond_model_ss = build_image_cond_model(
+        IMAGE_COND_CONFIGS["ss"], backbone=_shared_backbone, naf_model=_shared_naf)
+    pipeline.image_cond_model_shape_512 = build_image_cond_model(
+        IMAGE_COND_CONFIGS["shape_512"], backbone=_shared_backbone, naf_model=_shared_naf)
+    pipeline.image_cond_model_shape_1024 = build_image_cond_model(
+        IMAGE_COND_CONFIGS["shape_1024"], backbone=_shared_backbone, naf_model=_shared_naf)
+    pipeline.image_cond_model_tex_1024 = build_image_cond_model(
+        IMAGE_COND_CONFIGS["tex_1024"], backbone=_shared_backbone, naf_model=_shared_naf)
+    if _TIMING:
+        print(f"[TIMING]   model_load:extractors={time.perf_counter()-_t:.1f}s", flush=True)
 
     _cond_model_attrs = [
         'image_cond_model_ss', 'image_cond_model_shape_512',
         'image_cond_model_shape_1024', 'image_cond_model_tex_1024',
     ]
-    # Pre-load NAF upsampler weights for all modes (required before GPU transfer).
-    print("[NAF] Pre-loading NAF upsampler weights...")
-    for attr in _cond_model_attrs:
-        m = getattr(pipeline, attr, None)
-        if m is not None and getattr(m, 'use_naf_upsample', False):
-            m._load_naf()
+    # NAF is already pre-loaded and injected; no per-extractor _load_naf() needed.
 
     if smart_vram:
         # Smart-VRAM mode: small resident models (conditioning + decoders) live on
