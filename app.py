@@ -4,6 +4,7 @@ import argparse
 import math
 import time
 import shutil
+import socket
 import cv2
 import torch
 import numpy as np
@@ -30,11 +31,80 @@ os.environ.setdefault("ATTN_BACKEND", "flash_attn")
 os.environ["FLEX_GEMM_AUTOTUNE_CACHE_PATH"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'autotune_cache.json')
 os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
-import spaces
+try:
+    import spaces
+except ImportError:
+    class _SpacesStub:
+        class GPU:
+            def __init__(self, **kwargs):
+                pass
+
+            def __call__(self, fn):
+                return fn
+
+    spaces = _SpacesStub()
+
 from gradio import Server
 from gradio.data_classes import FileData
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+
+
+def _patch_gradio_lan_file_handling():
+    """Gradio SSRF protection rejects private/LAN hostnames in file URLs.
+
+    When clients connect via http://192.168.x.x, uploaded files are referenced
+    by URLs on that host and async_ssrf_protected_download fails.  For local
+    networks, resolve gradio file= paths on disk or fetch without SSRF checks.
+    """
+    import asyncio
+    import ipaddress
+    from urllib.parse import unquote, urlparse
+
+    import httpx
+    from gradio import processing_utils as pu
+
+    _orig_download = pu.async_ssrf_protected_download
+    _orig_get = pu.async_ssrf_protected_get
+
+    def _is_private_host(host: str | None) -> bool:
+        if not host or host == "localhost":
+            return bool(host)
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            return False
+
+    def _path_from_gradio_file_url(url: str) -> str | None:
+        if "file=" not in url:
+            return None
+        local_path = unquote(url.split("file=", 1)[1].split("?")[0])
+        if os.path.isfile(local_path):
+            return local_path
+        return None
+
+    async def _lan_async_ssrf_protected_download(url: str, cache_dir: str) -> str:
+        local_path = _path_from_gradio_file_url(url)
+        if local_path:
+            return pu.save_file_to_cache(local_path, cache_dir)
+
+        if _is_private_host(urlparse(url).hostname):
+            return await asyncio.to_thread(pu.unsafe_download, url, cache_dir)
+
+        return await _orig_download(url, cache_dir)
+
+    async def _lan_async_ssrf_protected_get(url: str) -> httpx.Response:
+        if _is_private_host(urlparse(url).hostname):
+            async with httpx.AsyncClient() as client:
+                return await client.get(url, follow_redirects=False)
+        return await _orig_get(url)
+
+    pu.async_ssrf_protected_download = _lan_async_ssrf_protected_download
+    pu.async_ssrf_protected_get = _lan_async_ssrf_protected_get
+
+
+_patch_gradio_lan_file_handling()
 
 from pixal3d.modules.sparse import SparseTensor
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
@@ -123,6 +193,24 @@ pipeline = None
 moge_model = None
 envmap = None
 LOW_VRAM = os.environ.get("LOW_VRAM", "0") == "1"
+SMART_VRAM = os.environ.get("SMART_VRAM", "0") == "1"
+
+
+def _vram_efficient_mode() -> bool:
+    """True when models are not all permanently resident on GPU."""
+    return LOW_VRAM or SMART_VRAM
+
+
+def _local_ip() -> str:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
 
 def init_models():
     global pipeline, moge_model, envmap
@@ -180,33 +268,48 @@ def init_models():
         pipeline.image_cond_model_tex_1024 = build_image_cond_model(
             IMAGE_COND_CONFIGS["tex_1024"], backbone=_shared_backbone, naf_model=_shared_naf)
 
-        if LOW_VRAM:
-            # Low-VRAM mode: models stay on CPU, loaded to GPU on-demand per stage.
+        _cond_model_attrs = [
+            'image_cond_model_ss', 'image_cond_model_shape_512',
+            'image_cond_model_shape_1024', 'image_cond_model_tex_1024',
+        ]
+        if SMART_VRAM:
+            pipeline.low_vram = True
+            pipeline.smart_vram = True
+            pipeline._device = torch.device("cuda")
+            for attr in _cond_model_attrs:
+                m = getattr(pipeline, attr, None)
+                if m is not None:
+                    m.cuda()
+            for name in ['sparse_structure_decoder', 'shape_slat_decoder', 'tex_slat_decoder']:
+                if name in pipeline.models:
+                    pipeline.models[name].cuda()
+            if pipeline.rembg_model is not None:
+                pipeline.rembg_model.cuda()
+            _shared_naf.cuda()
+            print("[Pipeline] Smart-VRAM mode: resident models on GPU, large DiTs stream on demand.")
+        elif LOW_VRAM:
             pipeline._device = torch.device("cuda")
             pipeline.low_vram = True
             print("[Pipeline] Low-VRAM mode enabled.")
         else:
-            # Standard mode: all models loaded to GPU at once.
             pipeline.low_vram = False
             pipeline.cuda()
             pipeline.image_cond_model_ss.cuda()
             pipeline.image_cond_model_shape_512.cuda()
             pipeline.image_cond_model_shape_1024.cuda()
             pipeline.image_cond_model_tex_1024.cuda()
-            # Move shared NAF to GPU (shared ref — one .cuda() call covers all)
             _shared_naf.cuda()
-                
+
         print("[MoGe-2] Loading model for camera estimation...")
-        if LOW_VRAM:
-            # Low-VRAM: load MoGe to CPU, move to GPU on-demand per request.
+        if _vram_efficient_mode():
             moge_model = load_moge_model(device="cpu")
-            print("[MoGe-2] Low-VRAM mode: MoGe stays on CPU, loaded to GPU on-demand.")
+            print("[MoGe-2] VRAM-efficient mode: MoGe stays on CPU, loaded to GPU on-demand.")
         else:
             moge_model = load_moge_model(device="cuda")
-        
+
         print("[EnvMap] Loading environment maps...")
         _base = os.path.dirname(os.path.abspath(__file__))
-        _envmap_device = 'cpu' if LOW_VRAM else 'cuda'
+        _envmap_device = 'cpu' if _vram_efficient_mode() else 'cuda'
         envmap = {
             'forest': EnvMap(torch.tensor(cv2.cvtColor(cv2.imread(os.path.join(_base, 'assets/hdri/forest.exr'), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB), dtype=torch.float32, device=_envmap_device)),
             'sunset': EnvMap(torch.tensor(cv2.cvtColor(cv2.imread(os.path.join(_base, 'assets/hdri/sunset.exr'), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB), dtype=torch.float32, device=_envmap_device)),
@@ -239,11 +342,11 @@ def get_camera_params_wild_moge(image_path, device="cuda", mesh_scale=1.0, exten
     width, height = pil_image.size
     image_np = np.array(pil_image).astype(np.float32) / 255.0
     image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).to(device)
-    if LOW_VRAM:
+    if _vram_efficient_mode():
         moge_model.to(device)
     with torch.no_grad():
         output = moge_model.infer(image_tensor)
-    if LOW_VRAM:
+    if _vram_efficient_mode():
         moge_model.cpu()
         torch.cuda.empty_cache()
     intrinsics = output["intrinsics"].squeeze().cpu().numpy()
@@ -366,7 +469,7 @@ async def homepage():
 @app.get("/app_config")
 async def get_config():
     """Return server configuration for frontend (e.g. LOW_VRAM mode)."""
-    return JSONResponse({"low_vram": LOW_VRAM})
+    return JSONResponse({"low_vram": LOW_VRAM, "smart_vram": SMART_VRAM})
 
 @app.get("/progress")
 async def progress_poll(request: Request):
@@ -473,43 +576,60 @@ def generate_3d(
     mesh = mesh_list[0]
     state_path = pack_state(shape_slat, tex_slat, res)
     
-    _update_progress("Rendering views", 0, 1)
-    mesh.simplify(16777216)
-    cam_dist = camera_params['distance']
-    near = max(0.01, cam_dist - 2.0)
-    far = cam_dist + 10.0
-    if LOW_VRAM:
-        for v in envmap.values():
-            v.image = v.image.cuda()
-            if hasattr(v, '_nvdiffrec_envlight'):
-                del v._nvdiffrec_envlight
-    renders = render_utils.render_proj_aligned_video(
-        mesh, camera_angle_x=camera_params['camera_angle_x'],
-        distance=cam_dist, resolution=1024,
-        num_frames=STEPS, envmap=envmap,
-        near=near, far=far,
-    )
-    if LOW_VRAM:
-        for v in envmap.values():
-            if hasattr(v, '_nvdiffrec_envlight'):
-                del v._nvdiffrec_envlight
-            v.image = v.image.cpu()
-        torch.cuda.empty_cache()
-    _update_progress("Rendering views", 1, 1)
-    
-    # Save renders and return paths
     render_files = {}
-    for mode_key, frames in renders.items():
-        mode_files = []
-        for i, frame in enumerate(frames):
-            p = os.path.abspath(os.path.join(TMP_DIR, f"render_{mode_key}_{i}_{int(time.time()*1000)}.jpg"))
-            Image.fromarray(frame).save(p, quality=85)
-            mode_files.append(FileData(path=p))
-        render_files[mode_key] = mode_files
+    preview_glb_path = None
+    try:
+        from pixal3d.utils.fallback_mesh_renderer import export_preview_glb, nvdiffrast_available
+        use_nvdiffrast = nvdiffrast_available()
+        if not use_nvdiffrast:
+            print("[Render] nvdiffrast not available — exporting vertex-colored preview GLB.")
+            _update_progress("Rendering views", 0, 1)
+            preview_glb_path = os.path.abspath(
+                os.path.join(TMP_DIR, f"preview_{int(time.time()*1000)}.glb")
+            )
+            export_preview_glb(mesh, preview_glb_path)
+            _update_progress("Rendering views", 1, 1)
+        else:
+            _update_progress("Rendering views", 0, STEPS)
+            mesh.simplify(16777216)
+            cam_dist = camera_params['distance']
+            near = max(0.01, cam_dist - 2.0)
+            far = cam_dist + 10.0
+            if _vram_efficient_mode():
+                for v in envmap.values():
+                    v.image = v.image.cuda()
+                    if hasattr(v, '_nvdiffrec_envlight'):
+                        del v._nvdiffrec_envlight
+
+            preview_resolution = 1024
+            renders = render_utils.render_proj_aligned_video(
+                mesh, camera_angle_x=camera_params['camera_angle_x'],
+                distance=cam_dist, resolution=preview_resolution,
+                num_frames=STEPS, envmap=envmap,
+                near=near, far=far,
+            )
+            if _vram_efficient_mode():
+                for v in envmap.values():
+                    if hasattr(v, '_nvdiffrec_envlight'):
+                        del v._nvdiffrec_envlight
+                    v.image = v.image.cpu()
+                torch.cuda.empty_cache()
+            _update_progress("Rendering views", STEPS, STEPS)
+
+            for mode_key, frames in renders.items():
+                mode_files = []
+                for i, frame in enumerate(frames):
+                    p = os.path.abspath(os.path.join(TMP_DIR, f"render_{mode_key}_{i}_{int(time.time()*1000)}.jpg"))
+                    Image.fromarray(frame).save(p, quality=85)
+                    mode_files.append(FileData(path=p))
+                render_files[mode_key] = mode_files
+    except Exception as e:
+        print(f"[Render] Preview render failed ({e}) — skipping preview renders.")
 
     _finish_progress()
     return {
         "render_paths": render_files,
+        "preview_glb": preview_glb_path,
         "state_path": os.path.abspath(state_path),
         "camera_angle_x": camera_params['camera_angle_x'],
         "distance": camera_params['distance'],
@@ -517,15 +637,32 @@ def generate_3d(
 
 @app.api()
 @spaces.GPU(duration=240)
-def extract_glb_api(state_path: str, decimation_target: int, texture_size: int, session_id: str = "") -> FileData:
+def extract_glb_api(
+    state_path: str,
+    decimation_target: int,
+    texture_size: int,
+    dc_resolution: int = 256,
+    smooth_iterations: int = 0,
+    fill_holes: bool = True,
+    session_id: str = "",
+) -> FileData:
     init_models()
     _reset_progress(session_id)
     _update_progress("Decoding latent", 0, 1)
-    
+
+    if fill_holes:
+        os.environ.pop("SKIP_FILL_HOLES", None)
+    else:
+        os.environ["SKIP_FILL_HOLES"] = "1"
+
     shape_slat, tex_slat, res = unpack_state(state_path)
     mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
     _update_progress("Decoding latent", 1, 1)
-    
+
+    if smooth_iterations > 0:
+        mesh.smooth(smooth_iterations)
+
+    os.environ["DC_RESOLUTION"] = str(dc_resolution)
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
         coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
@@ -555,17 +692,54 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pixal3D Demo Server")
     parser.add_argument("--low_vram", action="store_true",
                         help="Enable low-VRAM mode: models lazy-load to GPU per stage.")
+    parser.add_argument("--smart_vram", action="store_true",
+                        help="Enable smart-VRAM mode: conditioning + decoders stay on GPU; "
+                             "large DiTs stream on demand. Faster than --low_vram.")
+    parser.add_argument("--host", type=str, default="0.0.0.0",
+                        help="Host to bind (default 0.0.0.0 for LAN access).")
+    parser.add_argument("--port", type=int, default=7861,
+                        help="Port to listen on (default 7861).")
+    parser.add_argument("--share", action="store_true",
+                        help="Create a temporary public Gradio tunnel (off by default).")
+    parser.add_argument("--skip-utils3d-reinstall", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Skip forced utils3d wheel reinstall on startup (default: skip).")
     args, remaining = parser.parse_known_args()
     if args.low_vram:
         LOW_VRAM = True
+    if args.smart_vram:
+        SMART_VRAM = True
 
-    # Re-install utils3d as in original app.py
-    subprocess.run([
-        sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps",
-        "https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl"
-    ], check=True)
-    
-    # Pre-initialize models before launching the server
+    if not args.skip_utils3d_reinstall:
+        subprocess.run([
+            sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+            "https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl"
+        ], check=True)
+
+    import socket
+    _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        _sock.bind((args.host, args.port))
+    except OSError as e:
+        _sock.close()
+        raise SystemExit(
+            f"[Server] Port {args.port} is already in use on {args.host}. "
+            f"Stop the other process or choose another port, e.g. PORT={args.port + 1} ./start.sh"
+        ) from e
+    _sock.close()
+
     init_models()
-    
-    app.launch(show_error=True, share=True)
+
+    lan_ip = _local_ip()
+    print(f"[Server] Local:   http://127.0.0.1:{args.port}")
+    print(f"[Server] LAN:     http://{lan_ip}:{args.port}")
+    if args.share:
+        print("[Server] Public Gradio tunnel enabled via --share")
+
+    app.launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+        show_error=True,
+    )

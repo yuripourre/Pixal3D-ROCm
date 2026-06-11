@@ -1,8 +1,32 @@
 from typing import *
+import os
+import warnings
 import torch
 from ..voxel import Voxel
 import cumesh
 from flex_gemm.ops.grid_sample import grid_sample_3d
+
+DEFAULT_PYMESHLAB_MAX_HOLE_SIZE = 30
+BOUNDING_BOX_SHRINK_THRESHOLD = 0.75
+
+
+def _should_skip_fill_holes() -> bool:
+    return os.environ.get("SKIP_FILL_HOLES", "").lower() in ("1", "true", "yes")
+
+
+def _mesh_to_pymeshlab(vertices: torch.Tensor, faces: torch.Tensor):
+    import pymeshlab as pml
+
+    ms = pml.MeshSet()
+    ms.add_mesh(pml.Mesh(vertices.cpu().numpy(), faces.cpu().numpy()))
+    return ms
+
+
+def _read_pymeshlab_mesh(ms, device: torch.device):
+    mesh = ms.current_mesh()
+    vertices = torch.from_numpy(mesh.vertex_matrix()).float().to(device)
+    faces = torch.from_numpy(mesh.face_matrix()).int().to(device)
+    return vertices, faces
 
 
 class Mesh:
@@ -32,7 +56,24 @@ class Mesh:
     def cpu(self):
         return self.to('cpu')
     
+    def _fill_holes_pymeshlab(self, max_hole_size: int = DEFAULT_PYMESHLAB_MAX_HOLE_SIZE) -> None:
+        try:
+            ms = _mesh_to_pymeshlab(self.vertices, self.faces)
+            ms.meshing_close_holes(maxholesize=max_hole_size)
+            new_vertices, new_faces = _read_pymeshlab_mesh(ms, self.device)
+            self.vertices = new_vertices
+            self.faces = new_faces
+        except Exception as e:
+            warnings.warn(
+                f"fill_holes pymeshlab fallback failed ({e}); skipping.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
     def fill_holes(self, max_hole_perimeter=3e-2):
+        if _should_skip_fill_holes():
+            return
+
         vertices = self.vertices.clone().cuda().contiguous()
         faces = self.faces.clone().cuda().contiguous()
 
@@ -59,23 +100,57 @@ class Mesh:
             # box shrank significantly in any axis, discard the result.
             orig_extent = vertices.max(dim=0).values - vertices.min(dim=0).values
             new_extent = new_vertices.max(dim=0).values - new_vertices.min(dim=0).values
-            if (new_extent < orig_extent * 0.75).any():
-                import warnings
+            if (new_extent < orig_extent * BOUNDING_BOX_SHRINK_THRESHOLD).any():
                 warnings.warn(
                     "fill_holes returned a mesh with a significantly smaller bounding box "
                     f"(orig {orig_extent.tolist()}, new {new_extent.tolist()}); "
                     "discarding fill_holes result.",
-                    RuntimeWarning, stacklevel=2,
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
+                self._fill_holes_pymeshlab()
                 return
 
             self.vertices = new_vertices.to(self.device)
             self.faces = new_faces.to(self.device)
         except Exception as e:
-            import warnings
             warnings.warn(
-                f"fill_holes failed ({e}); skipping.",
-                RuntimeWarning, stacklevel=2,
+                f"fill_holes failed ({e}); trying pymeshlab fallback.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._fill_holes_pymeshlab()
+
+    def smooth(self, iterations: int = 10) -> None:
+        if iterations <= 0:
+            return
+
+        try:
+            ms = _mesh_to_pymeshlab(self.vertices, self.faces)
+            ms.apply_coord_taubin_smoothing(stepsmoothnum=iterations)
+            new_vertices, new_faces = _read_pymeshlab_mesh(ms, self.device)
+            self.vertices = new_vertices
+            self.faces = new_faces
+        except Exception as e:
+            warnings.warn(
+                f"smooth failed ({e}); skipping.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def repair_topology(self) -> None:
+        try:
+            ms = _mesh_to_pymeshlab(self.vertices, self.faces)
+            ms.meshing_repair_non_manifold_edges(method=0)
+            ms.meshing_repair_non_manifold_vertices(vertdispratio=0)
+            new_vertices, new_faces = _read_pymeshlab_mesh(ms, self.device)
+            self.vertices = new_vertices
+            self.faces = new_faces
+        except Exception as e:
+            warnings.warn(
+                f"repair_topology failed ({e}); skipping.",
+                RuntimeWarning,
+                stacklevel=2,
             )
         
     def remove_faces(self, face_mask: torch.Tensor):

@@ -29,6 +29,8 @@ import o_voxel
 
 MOGE_MODEL_NAME = "Ruicheng/moge-2-vitl"
 MODEL_PATH = "TencentARC/Pixal3D"
+DEFAULT_DECIMATION_TARGET = 300_000
+DEFAULT_TEXTURE_SIZE = 4096
 
 IMAGE_COND_CONFIGS = {
     "ss": {
@@ -245,6 +247,11 @@ def run_inference(
     low_vram: bool = False,
     smart_vram: bool = False,
     resolution: int = -1,
+    decimation_target: int = DEFAULT_DECIMATION_TARGET,
+    texture_size: int = DEFAULT_TEXTURE_SIZE,
+    dc_resolution: int | None = None,
+    smooth_iterations: int = 0,
+    fill_holes: bool = True,
 ):
     # Load models
     _t_total = time.perf_counter()
@@ -313,6 +320,12 @@ def run_inference(
 
     pipeline_type = f"{resolution if resolution > 0 else (1024 if (low_vram or smart_vram) else 1536)}_cascade"
     print(f"[Inference] Using pipeline_type={pipeline_type}")
+
+    if fill_holes:
+        os.environ.pop("SKIP_FILL_HOLES", None)
+    else:
+        os.environ["SKIP_FILL_HOLES"] = "1"
+
     _t = time.perf_counter()
     mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
         image_preprocessed,
@@ -331,14 +344,20 @@ def run_inference(
         print(f"[TIMING] pipeline_run={time.perf_counter()-_t:.1f}s", flush=True)
     mesh = mesh_list[0]
 
+    if smooth_iterations > 0:
+        print(f"[Inference] Smoothing mesh ({smooth_iterations} Taubin passes)...")
+        mesh.smooth(smooth_iterations)
+
     # Extract GLB
     print("[Inference] Extracting GLB...")
     _t = time.perf_counter()
+    if dc_resolution is not None:
+        os.environ["DC_RESOLUTION"] = str(dc_resolution)
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
         coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
         grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=1000000, texture_size=4096,
+        decimation_target=decimation_target, texture_size=texture_size,
         remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
     )
 
@@ -380,6 +399,16 @@ if __name__ == "__main__":
                              "Faster than --low_vram with similar peak VRAM. Pins to 1024 resolution.")
     parser.add_argument("--resolution", type=int, default=-1,
                         help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram/--smart_vram, else 1536.")
+    parser.add_argument("--decimation_target", type=int, default=DEFAULT_DECIMATION_TARGET,
+                        help="Max face count in exported GLB (default 300k; use 100k for low-poly, 1M for max detail)")
+    parser.add_argument("--texture_size", type=int, default=DEFAULT_TEXTURE_SIZE,
+                        help="Baked PBR texture resolution for exported GLB")
+    parser.add_argument("--dc_resolution", type=int, default=None,
+                        help="Dual-contouring remesh resolution (o_voxel DC_RESOLUTION env var; default 256)")
+    parser.add_argument("--smooth_iterations", type=int, default=0,
+                        help="Taubin smoothing passes before GLB export (0 = disabled)")
+    parser.add_argument("--no_fill_holes", action="store_true",
+                        help="Skip hole filling during mesh decode")
 
     args = parser.parse_args()
 
@@ -392,4 +421,9 @@ if __name__ == "__main__":
         low_vram=args.low_vram,
         smart_vram=args.smart_vram,
         resolution=args.resolution,
+        decimation_target=args.decimation_target,
+        texture_size=args.texture_size,
+        dc_resolution=args.dc_resolution,
+        smooth_iterations=args.smooth_iterations,
+        fill_holes=not args.no_fill_holes,
     )

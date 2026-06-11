@@ -137,8 +137,26 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             'alpha': slice(5, 6),
         }
         pipeline._device = 'cpu'
+        pipeline._repo_path = path
 
         return pipeline
+
+    def _reload_missing_models(self):
+        """Re-load checkpoints removed from self.models during smart_vram streaming."""
+        if not getattr(self, 'smart_vram', False):
+            return
+        if not hasattr(self, '_pretrained_args'):
+            return
+        from .. import models as model_zoo
+        repo = getattr(self, '_repo_path', 'TencentARC/Pixal3D')
+        for key, rel_path in self._pretrained_args['models'].items():
+            if key in self.models:
+                continue
+            print(f"[Pipeline] Reloading {key} (smart_vram)...")
+            try:
+                self.models[key] = model_zoo.from_pretrained(f"{repo}/{rel_path}")
+            except Exception:
+                self.models[key] = model_zoo.from_pretrained(rel_path)
 
     def to(self, device: torch.device) -> None:
         self._device = device
@@ -688,6 +706,8 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             pipeline_type (str): The type of the pipeline. Options: '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
         """
+        self._reload_missing_models()
+
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '1024_cascade':

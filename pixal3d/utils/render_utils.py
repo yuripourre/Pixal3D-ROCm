@@ -7,6 +7,7 @@ from PIL import Image
 
 from ..renderers import MeshRenderer, VoxelRenderer, PbrMeshRenderer
 from ..representations import Mesh, Voxel, MeshWithPbrMaterial, MeshWithVoxel
+from .fallback_mesh_renderer import nvdiffrast_available, render_proj_aligned_video_fallback
 from .random_utils import sphere_hammersley_sequence
 
 
@@ -204,6 +205,20 @@ def render_proj_aligned_video(sample, camera_angle_x, distance, resolution=1024,
     if 'far' in kwargs:
         render_options['far'] = kwargs.pop('far')
     
+    if not nvdiffrast_available():
+        return render_proj_aligned_video_fallback(
+            sample,
+            camera_angle_x=camera_angle_x,
+            distance=distance,
+            resolution=resolution,
+            num_frames=num_frames,
+            bg_color=bg_color,
+            near=render_options.get("near", 0.01),
+            far=render_options.get("far", 100.0),
+            envmap=kwargs.get("envmap"),
+            progress_callback=kwargs.get("progress_callback"),
+        )
+
     return render_frames(sample, extrinsics_list, intrinsics_list,
                          render_options, **kwargs)
 
